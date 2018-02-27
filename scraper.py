@@ -324,8 +324,8 @@ class ScrapeProperties(SessionMixin):
         return prop
 
 
-# grab = ScrapeProperties()
-# grab.execute(save_pickle)
+grab = ScrapeProperties()
+grab.execute(save_pickle)
 
 rows = get_rows_from_pickles()
 transposed, max_permits = transpose(rows)
