@@ -1,11 +1,27 @@
+# -*- coding: utf-8 -*-
 import requests
 import re
 import csv
+import pickle
+from collections import defaultdict
 from scrapy.http import HtmlResponse
 from scrapy.selector import Selector
+from concurrent.futures import ThreadPoolExecutor
+
+thread_pool = ThreadPoolExecutor(25)
 
 
-def dump_csv(properties):
+def threaded(fn):
+    def wrapper(*args, **kwargs):
+        return thread_pool.submit(fn, *args, **kwargs)
+    return wrapper
+
+
+def save_pickle(ward, properties):
+    pickle.dump(properties, open( "save_%s.p" % ward, "wb" ))
+
+
+def dump_csv(properties, max_permits):
     with open('stl_properties_by_ward.csv', 'w') as csvfile:
         fieldnames = [
                 "address",
@@ -16,7 +32,19 @@ def dump_csv(properties):
                 "ward",
                 "realtor",
                 "parcel_id",
+                "zoning",
+                "owner",
         ]
+
+        for i in range(max_permits):
+            fieldnames.append('Permit %d Owner Name' % (i + 1))
+            fieldnames.append('Permit %d Permit Type' % (i + 1))
+            fieldnames.append('Permit %d Application Date' % (i + 1))
+            fieldnames.append('Permit %d Completion Date' % (i + 1))
+            fieldnames.append('Permit %d Issued Date' % (i + 1))
+            fieldnames.append('Permit %d New Use' % (i + 1))
+            fieldnames.append('Permit %d Estimated Costs' % (i + 1))
+            fieldnames.append('Permit %d Description' % (i + 1))
 
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -24,6 +52,35 @@ def dump_csv(properties):
         for x in properties:
             writer.writerow(x)
 
+
+def transpose(rows):
+    max_permits = max([len(x['permits']) for x in rows])
+    rows_with_permits = list()
+    for x in rows:
+        x = defaultdict(str, x)
+        for idx, val in enumerate(x['permits']):
+            t = defaultdict(str, val)
+            x['Permit %d Owner Name' % (idx + 1)] = t['Owner Name']
+            x['Permit %d Permit Type' % (idx + 1)] = t['Permit Type']
+            x['Permit %d Application Date' % (idx + 1)] = t['Application Date']
+            x['Permit %d Completion Date' % (idx + 1)] = t['Completion Date']
+            x['Permit %d Issued Date' % (idx + 1)] = t['Issued Date']
+            x['Permit %d New Use' % (idx + 1)] = t['New Use']
+            x['Permit %d Estimated Costs' % (idx + 1)] = t['Estimated Costs']
+            x['Permit %d Description' % (idx + 1)] = t['Description']
+        x.pop('permits')
+        rows_with_permits.append(x)
+
+    return rows_with_permits, max_permits
+
+def get_rows_from_pickles():
+    rows = list()
+    for i in range(1, 28):
+        temp_rows = pickle.load(open('save_%s.p' % i, 'rb'))
+        print(len(temp_rows), 'save_%s.p' % i)
+        rows += temp_rows
+    print(len(rows))
+    return rows
 
 class SessionMixin:
 
@@ -64,23 +121,21 @@ class ScrapeProperties(SessionMixin):
         return Selector(response=response)
 
     def execute(self, action):
-        ward = 1
+        # wards = range(1, 28)
+        wards = [3]
+        for x in wards:
+            self.scrape_ward(x, action)
 
-        all_properties = list()
+        # Wait for threads to finish before proceeding.
+        thread_pool.shutdown(wait=True)
 
-        while ward:
-            ward_properties = self.paginate(ward)
-            count = len(ward_properties)
-            all_properties += ward_properties
-            print('%s properties found for ward %s' % (count, ward))
-
-            if count > 0:
-                ward += 1
-            else:
-                ward = 0
-
+    @threaded
+    def scrape_ward(self, ward, action):
+        ward_properties = self.paginate(ward)
+        count = len(ward_properties)
+        print('%s properties found for ward %s' % (count, ward))
         # Call callback function
-        action(all_properties)
+        action(ward, ward_properties)
 
     def paginate(self, ward):
         row = 1
@@ -98,10 +153,9 @@ class ScrapeProperties(SessionMixin):
             print('scraping page %s of ward %s' % (page, ward))
             res = self.get(url.format(row=row, ward=ward))
             properties = self.parse_properties(res, ward)
+            properties_with_detail = self.get_details(properties)
+
             page_properties += properties
-            # print('%s properties scraped' % len(properties))
-            # print('row %s' % row)
-            # print('page %s' % page)
 
             # Control
             if len(properties) > 0:
@@ -111,6 +165,89 @@ class ScrapeProperties(SessionMixin):
                 row = 0
 
         return page_properties
+
+    def get_details(self, properties):
+        for prop in properties:
+            url = (
+                "https://www.stlouis-mo.gov/data/address-search/index.cfm?"
+                "parcelid={parcel_id}&firstview=true&categoryBy=form.start,"
+                "form.RealEstatePropertyInfor,form.BoundaryGeography,"
+                "form.ResidentialServices,form.TrashMaintenance,"
+                "form.ElectedOfficialsContacts,form.RealEstatePropertyInfor"
+                ",form.BoundaryGeography,form.TrashMaintenance,"
+                "form.ElectedOfficialsContacts"
+            )
+
+            payload = self.get(url.format(parcel_id=prop['parcel_id']))
+            selector = self.get_selector(payload)
+
+            land_use_table = selector.xpath(
+                "//*[contains(text(),'Land Use Information')]//..//table"
+            )
+
+            property_information_table = selector.xpath(
+                "//*[contains(text(),'Property Information')]//..//table"
+            )
+
+            permit_table = selector.xpath(
+                ".//*[contains(text(),'Permit Type')]//../../../tr"
+            )
+
+            try:
+                zoning = land_use_table.xpath(
+                    "//*[contains(text(), 'Zoning:')]//..//td/text()"
+                ).extract()[0]
+            except:
+                zoning = None
+
+            try:
+                land_use = land_use_table.xpath(
+                    "//*[contains(text(), 'Land use:')]//..//td/text()"
+                ).extract()[0]
+            except:
+                land_use = None
+
+            try:
+                owner = property_information_table.xpath(
+                    "//*[contains(text(), 'Owner name:')]//..//td/text()"
+                ).extract()[0]
+            except:
+                owner = None
+
+            permits = self.parse_permits(permit_table)
+            prop['permits'] = permits
+            prop['zoning'] = zoning
+            prop['land_use'] = zoning
+            prop['owner'] = zoning
+
+        return properties
+
+    def parse_permits(self, table):
+        permits = []
+
+        # If we don't have any
+        try:
+            headers = table.pop(0).xpath('./th//text()').extract()
+        except:
+            return list()
+
+        headers = [x.strip() for x in headers if x is not '\n']
+
+        for x in table:
+            raw_row = x.xpath('.//td')
+            extracted_row = [x.xpath('./text()').extract() for x in raw_row]
+            row = list()
+            for y in extracted_row:
+                if len(y) > 0:
+                    row.append(y[0].strip())
+                else:
+                    row.append('')
+
+            p = {headers[idx]: x.strip() for idx, x in enumerate(row)}
+
+            permits.append(p)
+
+        return permits
 
     def parse_properties(self, payload, ward):
         container_xpath = (
@@ -187,5 +324,9 @@ class ScrapeProperties(SessionMixin):
         return prop
 
 
-grab = ScrapeProperties()
-grab.execute(dump_csv)
+# grab = ScrapeProperties()
+# grab.execute(save_pickle)
+
+rows = get_rows_from_pickles()
+transposed, max_permits = transpose(rows)
+dump_csv(transposed, max_permits)
